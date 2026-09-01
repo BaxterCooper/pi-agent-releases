@@ -189,7 +189,7 @@ function Invoke-HttpsDownload {
                     $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
                     $fileStream = [IO.File]::Open($Destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
                     $destinationCreated = $true
-                    $stream.CopyToAsync($fileStream).GetAwaiter().GetResult()
+                    [void]($stream.CopyToAsync($fileStream).GetAwaiter().GetResult())
                     $downloaded = $true
                     return
                 }
@@ -247,7 +247,11 @@ function Get-Release {
     $assetsValue = Get-PropertyValue -Object $release -Name 'assets'
     $draft = Get-PropertyValue -Object $release -Name 'draft'
     $publishedAt = Get-PropertyValue -Object $release -Name 'published_at'
-    if ($tagValue -isnot [string] -or [string]::IsNullOrWhiteSpace($tagValue) -or $null -eq $assetsValue -or $draft -isnot [bool] -or $draft -or $publishedAt -isnot [string] -or [string]::IsNullOrWhiteSpace($publishedAt)) {
+    $publishedAtText = ''
+    if ($null -ne $publishedAt) {
+        $publishedAtText = [System.Convert]::ToString($publishedAt, [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($tagValue -isnot [string] -or [string]::IsNullOrWhiteSpace($tagValue) -or $null -eq $assetsValue -or $draft -isnot [bool] -or $draft -or $null -eq $publishedAt -or [string]::IsNullOrWhiteSpace($publishedAtText)) {
         Stop-Bootstrap 'The selected GitHub release was missing valid publication metadata or assets.'
     }
     $assets = @($assetsValue)
@@ -454,7 +458,14 @@ function Get-PiAgentUninstallEntries {
 function Get-CanonicalInstallLocation {
     param([Parameter(Mandatory = $true)][string]$Value)
 
-    if ([string]::IsNullOrWhiteSpace($Value) -or $Value -match '[\x00-\x1F]' -or $Value -notmatch '^[A-Za-z]:\\') {
+    $normalizedValue = $Value
+    if ($normalizedValue.IndexOf('"') -ge 0) {
+        if ($normalizedValue.Length -lt 2 -or $normalizedValue[0] -cne '"' -or $normalizedValue[$normalizedValue.Length - 1] -cne '"' -or $normalizedValue.Substring(1, $normalizedValue.Length - 2).IndexOf('"') -ge 0) {
+            Stop-Bootstrap 'The current-user Pi Agent uninstall entry had an invalid quoted InstallLocation.'
+        }
+        $normalizedValue = $normalizedValue.Substring(1, $normalizedValue.Length - 2)
+    }
+    if ([string]::IsNullOrWhiteSpace($normalizedValue) -or $normalizedValue -match '[\x00-\x1F]' -or $normalizedValue -notmatch '^[A-Za-z]:\\') {
         Stop-Bootstrap 'The current-user Pi Agent uninstall entry had an invalid absolute InstallLocation.'
     }
     $localAppData = [Environment]::GetEnvironmentVariable('LOCALAPPDATA', 'Process')
@@ -464,7 +475,7 @@ function Get-CanonicalInstallLocation {
 
     try {
         $localRootInfo = New-Object IO.DirectoryInfo($localAppData)
-        $locationInfo = New-Object IO.DirectoryInfo($Value)
+        $locationInfo = New-Object IO.DirectoryInfo($normalizedValue)
         if (-not $localRootInfo.Exists -or -not $locationInfo.Exists) {
             Stop-Bootstrap 'The current-user Pi Agent InstallLocation did not exist.'
         }
@@ -477,9 +488,6 @@ function Get-CanonicalInstallLocation {
         $localRootPrefix = $localRootPath + $separator
         if (-not $locationPath.StartsWith($localRootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
             Stop-Bootstrap 'The current-user Pi Agent InstallLocation was outside LOCALAPPDATA.'
-        }
-        if ([IO.Path]::GetFileName($locationPath) -cne 'Pi Agent') {
-            Stop-Bootstrap 'The current-user Pi Agent InstallLocation did not end in Pi Agent.'
         }
         return $locationPath
     }
@@ -662,11 +670,23 @@ function Invoke-Uninstall {
         Stop-Bootstrap "The registered Pi Agent uninstaller failed with exit code $exitCode."
     }
 
-    $remaining = Get-SinglePiAgentEntry -Purpose 'verify the uninstall'
-    if ($null -ne $remaining) {
-        Stop-Bootstrap 'The registered uninstaller completed but the current-user Pi Agent uninstall entry remains.'
+    $deadline = [System.Diagnostics.Stopwatch]::GetTimestamp() + ([System.Diagnostics.Stopwatch]::Frequency * 60)
+    $remaining = @()
+    do {
+        $remaining = @(Get-PiAgentUninstallEntries)
+        if ($remaining.Count -eq 0) {
+            Write-Output 'Pi Agent was uninstalled for the current user.'
+            return
+        }
+        if ([System.Diagnostics.Stopwatch]::GetTimestamp() -ge $deadline) {
+            break
+        }
+        Start-Sleep -Milliseconds 250
+    } while ($true)
+    if ($remaining.Count -gt 1) {
+        Stop-Bootstrap 'The registered uninstaller completed but multiple current-user Pi Agent uninstall entries remain.'
     }
-    Write-Output 'Pi Agent was uninstalled for the current user.'
+    Stop-Bootstrap 'The registered uninstaller completed but the current-user Pi Agent uninstall entry remains.'
 }
 
 function Invoke-Status {
