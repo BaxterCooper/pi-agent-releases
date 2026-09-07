@@ -2,7 +2,12 @@
 set -euo pipefail
 export LC_ALL=C
 
+# Generated source: BaxterCooper/pi-agent apps/desktop/bootstrap/install.sh. The
+# desktop release workflow publishes this file to BaxterCooper/pi-agent-releases.
 API_ROOT='https://api.github.com/repos/BaxterCooper/pi-agent-releases'
+BUNDLE_ID='dev.baxter.pi-agent'
+# Bundle names installed by earlier bootstraps under the same bundle identifier.
+LEGACY_APP_NAMES=('Pi Agent.app')
 ACTION='install'
 CHANNEL='stable'
 TEMP_ROOT=''
@@ -28,7 +33,7 @@ MOUNT_POINTS=()
 APP_CANDIDATES=()
 
 fail() {
-  printf 'Pi Agent bootstrap: %s\n' "$*" >&2
+  printf 'OMP Agent bootstrap: %s\n' "$*" >&2
   exit 1
 }
 
@@ -79,7 +84,7 @@ cleanup() {
     fi
   fi
   if [ "$backup_preserved" -eq 1 ] && [ -n "$BACKUP_DIR" ]; then
-    printf 'Pi Agent bootstrap: previous app backup preserved at %s; restore it manually after resolving the failure.\n' "$BACKUP_DIR" >&2
+    printf 'OMP Agent bootstrap: previous app backup preserved at %s; restore it manually after resolving the failure.\n' "$BACKUP_DIR" >&2
   fi
   if [ -n "$TEMP_ROOT" ] && [ -e "$TEMP_ROOT" ]; then
     /bin/rm -rf "$TEMP_ROOT" >/dev/null 2>&1 || true
@@ -103,7 +108,7 @@ assert_user_context() {
     *$'\r'*|*$'\n'*) fail 'HOME contained control characters.' ;;
   esac
   APP_DIR="$HOME/Applications"
-  TARGET_APP="$APP_DIR/Pi Agent.app"
+  TARGET_APP="$APP_DIR/OMP Agent.app"
 }
 
 assert_supported_macos_arm64() {
@@ -200,6 +205,14 @@ assert_https_url() {
   esac
 }
 
+# plutil -lint validates property lists only; on macOS 26 it rejects every JSON
+# document, and an XML conversion rejects JSON null (GitHub emits null labels
+# and bodies). A JSON-to-JSON conversion parses exactly what extract_raw parses.
+assert_json_document() {
+  local document=$1
+  [ -f "$document" ] && /usr/bin/plutil -convert json -o /dev/null "$document" >/dev/null 2>&1
+}
+
 extract_raw() {
   local key=$1
   local plist=$2
@@ -253,7 +266,7 @@ resolve_release() {
   esac
 
   api_get "$endpoint" "$release_json"
-  if ! /usr/bin/plutil -lint "$release_json" >/dev/null 2>&1; then
+  if ! assert_json_document "$release_json"; then
     fail 'GitHub Releases returned malformed JSON.'
   fi
   if ! tag=$(extract_raw 'tag_name' "$release_json" 2>/dev/null); then
@@ -541,11 +554,22 @@ locate_source_app() {
   for mount_point in "${MOUNT_POINTS[@]}"; do
     while IFS= read -r -d '' candidate; do
       APP_CANDIDATES[${#APP_CANDIDATES[@]}]=$candidate
-    done < <(/usr/bin/find "$mount_point" -xdev -type d -name 'Pi Agent.app' -print0 2>/dev/null)
+    done < <(/usr/bin/find "$mount_point" -xdev -maxdepth 2 -type d -name '*.app' -print0 2>/dev/null)
   done
-  if [ "${#APP_CANDIDATES[@]}" -ne 1 ]; then
-    fail "Expected exactly one Pi Agent.app in the mounted DMG, found ${#APP_CANDIDATES[@]}."
+  # Match by CFBundleIdentifier so the bootstrap accepts every release regardless
+  # of the bundle's display name (Pi Agent.app before 0.3.0, OMP Agent.app after).
+  local matched=()
+  if [ "${#APP_CANDIDATES[@]}" -gt 0 ]; then
+    for candidate in "${APP_CANDIDATES[@]}"; do
+      if bundle_version "$candidate" >/dev/null; then
+        matched[${#matched[@]}]=$candidate
+      fi
+    done
   fi
+  if [ "${#matched[@]}" -ne 1 ]; then
+    fail "Expected exactly one $BUNDLE_ID application bundle in the mounted DMG, found ${#matched[@]}."
+  fi
+  APP_CANDIDATES=("${matched[@]}")
   SOURCE_APP=${APP_CANDIDATES[0]}
 }
 
@@ -561,7 +585,7 @@ bundle_version() {
   if ! identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist_path" 2>/dev/null); then
     return 1
   fi
-  if [ "$identifier" != 'dev.baxter.pi-agent' ]; then
+  if [ "$identifier" != "$BUNDLE_ID" ]; then
     return 1
   fi
   if ! version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist_path" 2>/dev/null); then
@@ -609,9 +633,9 @@ stage_and_replace() {
   if ! STAGE_DIR=$(/usr/bin/mktemp -d "$APP_DIR/.pi-agent-stage.XXXXXX"); then
     fail 'Could not create same-volume staging directory.'
   fi
-  staged_app="$STAGE_DIR/Pi Agent.app"
+  staged_app="$STAGE_DIR/OMP Agent.app"
   if ! /usr/bin/ditto "$SOURCE_APP" "$staged_app"; then
-    fail 'Could not stage Pi Agent.app in the per-user Applications directory.'
+    fail 'Could not stage OMP Agent.app in the per-user Applications directory.'
   fi
   if ! staged_version=$(bundle_version "$staged_app"); then
     fail 'The staged app did not contain CFBundleShortVersionString.'
@@ -625,30 +649,30 @@ stage_and_replace() {
     if ! BACKUP_DIR=$(/usr/bin/mktemp -d "$APP_DIR/.pi-agent-backup.XXXXXX"); then
       fail 'Could not create same-volume backup directory.'
     fi
-    BACKUP_APP="$BACKUP_DIR/Pi Agent.app"
+    BACKUP_APP="$BACKUP_DIR/OMP Agent.app"
     if ! /bin/mv "$TARGET_APP" "$BACKUP_APP"; then
-      fail 'Could not move the existing Pi Agent.app to a rollback backup.'
+      fail 'Could not move the existing OMP Agent.app to a rollback backup.'
     fi
     TARGET_MOVED_TO_BACKUP=1
   fi
 
   if ! /bin/mv "$staged_app" "$TARGET_APP"; then
     if [ "$had_existing" -eq 1 ] && ! rollback_replacement; then
-      fail 'Replacement failed and rollback could not restore the previous Pi Agent.app.'
+      fail 'Replacement failed and rollback could not restore the previous OMP Agent.app.'
     fi
-    fail 'Could not replace Pi Agent.app in the per-user Applications directory.'
+    fail 'Could not replace OMP Agent.app in the per-user Applications directory.'
   fi
   TARGET_INSTALLED=1
 
   if ! final_version=$(bundle_version "$TARGET_APP"); then
     if ! rollback_replacement; then
-      fail 'The installed app was unreadable and rollback could not restore the previous Pi Agent.app.'
+      fail 'The installed app was unreadable and rollback could not restore the previous OMP Agent.app.'
     fi
     fail 'The installed app did not contain CFBundleShortVersionString.'
   fi
   if [ "$final_version" != "$RELEASE_VERSION" ]; then
     if ! rollback_replacement; then
-      fail 'The installed app version was wrong and rollback could not restore the previous Pi Agent.app.'
+      fail 'The installed app version was wrong and rollback could not restore the previous OMP Agent.app.'
     fi
     fail "The installed app version '$final_version' did not match release version '$RELEASE_VERSION'."
   fi
@@ -656,7 +680,7 @@ stage_and_replace() {
   if [ "$had_existing" -eq 1 ]; then
     if ! /bin/rm -rf "$BACKUP_DIR"; then
       if ! rollback_replacement; then
-        fail 'The replacement succeeded but backup cleanup failed and rollback could not restore the previous Pi Agent.app.'
+        fail 'The replacement succeeded but backup cleanup failed and rollback could not restore the previous OMP Agent.app.'
       fi
       fail 'The replacement backup could not be cleaned up.'
     fi
@@ -668,6 +692,26 @@ stage_and_replace() {
     fail 'The staging directory could not be cleaned up.'
   fi
   STAGE_DIR=''
+}
+
+remove_legacy_bundles() {
+  local name
+  local legacy
+  for name in "${LEGACY_APP_NAMES[@]}"; do
+    legacy="$APP_DIR/$name"
+    if [ ! -e "$legacy" ] && [ ! -L "$legacy" ]; then
+      continue
+    fi
+    if ! bundle_version "$legacy" >/dev/null; then
+      printf 'OMP Agent bootstrap: left %s in place; it is not a readable %s bundle.\n' "$legacy" "$BUNDLE_ID" >&2
+      continue
+    fi
+    if /bin/rm -rf "$legacy"; then
+      printf 'Removed superseded bundle %s\n' "$legacy"
+    else
+      printf 'OMP Agent bootstrap: could not remove superseded bundle %s; remove it manually.\n' "$legacy" >&2
+    fi
+  done
 }
 
 install_release() {
@@ -691,33 +735,35 @@ install_release() {
   mount_dmg
   locate_source_app
   stage_and_replace
-  printf 'Pi Agent version %s installed at %s\n' "$RELEASE_VERSION" "$TARGET_APP"
+  remove_legacy_bundles
+  printf 'OMP Agent version %s installed at %s\n' "$RELEASE_VERSION" "$TARGET_APP"
 }
 
 uninstall_app() {
   if [ -e "$TARGET_APP" ] || [ -L "$TARGET_APP" ]; then
     if ! bundle_version "$TARGET_APP" >/dev/null; then
-      fail "Refusing to remove '$TARGET_APP': it is not a readable Pi Agent bundle."
+      fail "Refusing to remove '$TARGET_APP': it is not a readable OMP Agent bundle."
     fi
     if ! /bin/rm -rf "$TARGET_APP"; then
       fail "Could not remove '$TARGET_APP'."
     fi
-    printf 'Pi Agent was uninstalled from %s\n' "$TARGET_APP"
+    printf 'OMP Agent was uninstalled from %s\n' "$TARGET_APP"
   else
-    printf 'Pi Agent is not installed at %s\n' "$TARGET_APP"
+    printf 'OMP Agent is not installed at %s\n' "$TARGET_APP"
   fi
+  remove_legacy_bundles
 }
 
 status_app() {
   local version
   if [ ! -e "$TARGET_APP" ] && [ ! -L "$TARGET_APP" ]; then
-    printf 'Pi Agent is not installed at %s\n' "$TARGET_APP"
+    printf 'OMP Agent is not installed at %s\n' "$TARGET_APP"
     return
   fi
   if ! version=$(bundle_version "$TARGET_APP"); then
     fail "Could not read CFBundleShortVersionString from '$TARGET_APP'."
   fi
-  printf 'Pi Agent version %s\n' "$version"
+  printf 'OMP Agent version %s\n' "$version"
 }
 
 assert_user_context

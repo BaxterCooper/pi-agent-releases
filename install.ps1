@@ -12,13 +12,19 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Generated source: BaxterCooper/pi-agent apps/desktop/bootstrap/install.ps1. The
+# desktop release workflow publishes this file to BaxterCooper/pi-agent-releases.
 $ApiRoot = 'https://api.github.com/repos/BaxterCooper/pi-agent-releases'
+$ProductName = 'OMP Agent'
+# Tauri's NSIS installer keys the per-user uninstall entry by product name, so a
+# renamed product leaves the previous registration installed beside the new one.
+$LegacyProductNames = @('Pi Agent')
 $TempRoot = $null
 
 function Stop-Bootstrap {
     param([Parameter(Mandatory = $true)][string]$Message)
 
-    throw "Pi Agent bootstrap: $Message"
+    throw "OMP Agent bootstrap: $Message"
 }
 
 function Get-PropertyValue {
@@ -400,19 +406,20 @@ function Invoke-Install {
         }
         Assert-ChecksumSidecar -InstallerPath $installerPath -SidecarPath $sidecarPath -InstallerName $release.InstallerName
 
-        $exitCode = Invoke-Executable -FilePath $installerPath -Arguments '/S' -Purpose 'Pi Agent installer'
+        $exitCode = Invoke-Executable -FilePath $installerPath -Arguments '/S' -Purpose 'OMP Agent installer'
         if ($exitCode -ne 0) {
-            Stop-Bootstrap "The Pi Agent installer failed with exit code $exitCode."
+            Stop-Bootstrap "The OMP Agent installer failed with exit code $exitCode."
         }
 
         $entry = Get-SinglePiAgentEntry -Purpose 'verify the installation'
         if ($null -eq $entry) {
-            Stop-Bootstrap 'The installer completed but did not register Pi Agent for the current user.'
+            Stop-Bootstrap 'The installer completed but did not register OMP Agent for the current user.'
         }
         if ($entry.DisplayVersion -cne $release.Version) {
-            Stop-Bootstrap "Installed Pi Agent DisplayVersion '$($entry.DisplayVersion)' did not match release version '$($release.Version)'."
+            Stop-Bootstrap "Installed OMP Agent DisplayVersion '$($entry.DisplayVersion)' did not match release version '$($release.Version)'."
         }
-        Write-Output "Pi Agent version $($entry.DisplayVersion) installed for the current user."
+        Write-Output "OMP Agent version $($entry.DisplayVersion) installed for the current user."
+        Remove-LegacyInstallations
     }
     finally {
         if ($null -ne $script:TempRoot -and (Test-Path -LiteralPath $script:TempRoot)) {
@@ -423,6 +430,7 @@ function Invoke-Install {
 
 
 function Get-PiAgentUninstallEntries {
+    param([string]$DisplayName = $ProductName)
     $roots = @(
         'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
         'HKCU:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
@@ -436,7 +444,7 @@ function Get-PiAgentUninstallEntries {
         foreach ($key in @(Get-ChildItem -LiteralPath $root -ErrorAction Stop)) {
             $properties = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
             $displayNameValue = Get-PropertyValue -Object $properties -Name 'DisplayName'
-            if ($displayNameValue -isnot [string] -or $displayNameValue -cne 'Pi Agent') {
+            if ($displayNameValue -isnot [string] -or $displayNameValue -cne $DisplayName) {
                 continue
             }
             $displayVersionValue = Get-PropertyValue -Object $properties -Name 'DisplayVersion'
@@ -456,17 +464,20 @@ function Get-PiAgentUninstallEntries {
     return $entries
 }
 function Get-CanonicalInstallLocation {
-    param([Parameter(Mandatory = $true)][string]$Value)
+    param(
+        [Parameter(Mandatory = $true)][string]$Value,
+        [string]$DisplayName = $ProductName
+    )
 
     $normalizedValue = $Value
     if ($normalizedValue.IndexOf('"') -ge 0) {
         if ($normalizedValue.Length -lt 2 -or $normalizedValue[0] -cne '"' -or $normalizedValue[$normalizedValue.Length - 1] -cne '"' -or $normalizedValue.Substring(1, $normalizedValue.Length - 2).IndexOf('"') -ge 0) {
-            Stop-Bootstrap 'The current-user Pi Agent uninstall entry had an invalid quoted InstallLocation.'
+            Stop-Bootstrap "The current-user $DisplayName uninstall entry had an invalid quoted InstallLocation."
         }
         $normalizedValue = $normalizedValue.Substring(1, $normalizedValue.Length - 2)
     }
     if ([string]::IsNullOrWhiteSpace($normalizedValue) -or $normalizedValue -match '[\x00-\x1F]' -or $normalizedValue -notmatch '^[A-Za-z]:\\') {
-        Stop-Bootstrap 'The current-user Pi Agent uninstall entry had an invalid absolute InstallLocation.'
+        Stop-Bootstrap "The current-user $DisplayName uninstall entry had an invalid absolute InstallLocation."
     }
     $localAppData = [Environment]::GetEnvironmentVariable('LOCALAPPDATA', 'Process')
     if ([string]::IsNullOrWhiteSpace($localAppData) -or $localAppData -notmatch '^[A-Za-z]:\\') {
@@ -477,22 +488,22 @@ function Get-CanonicalInstallLocation {
         $localRootInfo = New-Object IO.DirectoryInfo($localAppData)
         $locationInfo = New-Object IO.DirectoryInfo($normalizedValue)
         if (-not $localRootInfo.Exists -or -not $locationInfo.Exists) {
-            Stop-Bootstrap 'The current-user Pi Agent InstallLocation did not exist.'
+            Stop-Bootstrap "The current-user $DisplayName InstallLocation did not exist."
         }
         if (($locationInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            Stop-Bootstrap 'The current-user Pi Agent InstallLocation was a reparse point.'
+            Stop-Bootstrap "The current-user $DisplayName InstallLocation was a reparse point."
         }
         $separator = [IO.Path]::DirectorySeparatorChar
         $localRootPath = $localRootInfo.FullName.TrimEnd($separator)
         $locationPath = $locationInfo.FullName.TrimEnd($separator)
         $localRootPrefix = $localRootPath + $separator
         if (-not $locationPath.StartsWith($localRootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-            Stop-Bootstrap 'The current-user Pi Agent InstallLocation was outside LOCALAPPDATA.'
+            Stop-Bootstrap "The current-user $DisplayName InstallLocation was outside LOCALAPPDATA."
         }
         return $locationPath
     }
     catch {
-        Stop-Bootstrap "The current-user Pi Agent InstallLocation could not be validated: $($_.Exception.Message)"
+        Stop-Bootstrap "The current-user $DisplayName InstallLocation could not be validated: $($_.Exception.Message)"
     }
 }
 function Get-SinglePiAgentEntry {
@@ -503,13 +514,13 @@ function Get-SinglePiAgentEntry {
         return $null
     }
     if ($entries.Count -ne 1) {
-        Stop-Bootstrap "Found multiple current-user Pi Agent uninstall entries while attempting to $Purpose."
+        Stop-Bootstrap "Found multiple current-user OMP Agent uninstall entries while attempting to $Purpose."
     }
     if ([string]::IsNullOrWhiteSpace($entries[0].DisplayVersion) -or -not (Test-SemanticVersion -Value $entries[0].DisplayVersion)) {
-        Stop-Bootstrap "The current-user Pi Agent uninstall entry had no valid semantic DisplayVersion while attempting to $Purpose."
+        Stop-Bootstrap "The current-user OMP Agent uninstall entry had no valid semantic DisplayVersion while attempting to $Purpose."
     }
     if ([string]::IsNullOrWhiteSpace($entries[0].InstallLocation)) {
-        Stop-Bootstrap "The current-user Pi Agent uninstall entry had no InstallLocation while attempting to $Purpose."
+        Stop-Bootstrap "The current-user OMP Agent uninstall entry had no InstallLocation while attempting to $Purpose."
     }
     $canonicalInstallLocation = Get-CanonicalInstallLocation -Value $entries[0].InstallLocation
     [void]($entries[0].InstallLocation = $canonicalInstallLocation)
@@ -520,7 +531,7 @@ function Split-UninstallCommand {
 
     $expanded = [Environment]::ExpandEnvironmentVariables($CommandLine)
     if ([string]::IsNullOrWhiteSpace($expanded) -or $expanded -match '[\x00-\x1F]') {
-        Stop-Bootstrap 'The registered Pi Agent uninstall command was empty or contained control characters.'
+        Stop-Bootstrap 'The registered OMP Agent uninstall command was empty or contained control characters.'
     }
     $line = $expanded.Trim()
 
@@ -529,19 +540,19 @@ function Split-UninstallCommand {
     if ($line.StartsWith('"', [StringComparison]::Ordinal)) {
         $closingQuote = $line.IndexOf('"', 1)
         if ($closingQuote -lt 0) {
-            Stop-Bootstrap 'The registered Pi Agent uninstall command had an unterminated quoted executable path.'
+            Stop-Bootstrap 'The registered OMP Agent uninstall command had an unterminated quoted executable path.'
         }
         $filePath = $line.Substring(1, $closingQuote - 1)
         $afterQuote = $line.Substring($closingQuote + 1)
         if ($afterQuote.Length -gt 0 -and -not [Char]::IsWhiteSpace($afterQuote[0])) {
-            Stop-Bootstrap 'The registered Pi Agent uninstall command had characters directly after the quoted executable path.'
+            Stop-Bootstrap 'The registered OMP Agent uninstall command had characters directly after the quoted executable path.'
         }
         $arguments = $afterQuote.Trim()
     }
     else {
         $match = [Regex]::Match($line, '^(?<file>[^\s"]+)(?:\s+(?<args>.*))?$')
         if (-not $match.Success) {
-            Stop-Bootstrap 'The registered Pi Agent uninstall command could not be parsed safely.'
+            Stop-Bootstrap 'The registered OMP Agent uninstall command could not be parsed safely.'
         }
         $filePath = $match.Groups['file'].Value
         if ($match.Groups['args'].Success) {
@@ -550,17 +561,17 @@ function Split-UninstallCommand {
     }
 
     if ([string]::IsNullOrWhiteSpace($filePath) -or $filePath.Contains('"') -or $filePath -notmatch '^[A-Za-z]:\\') {
-        Stop-Bootstrap 'The registered Pi Agent uninstall command had an invalid absolute executable path.'
+        Stop-Bootstrap 'The registered OMP Agent uninstall command had an invalid absolute executable path.'
     }
 
     try {
         $extension = [IO.Path]::GetExtension($filePath)
     }
     catch {
-        Stop-Bootstrap 'The registered Pi Agent uninstall command had an invalid executable path.'
+        Stop-Bootstrap 'The registered OMP Agent uninstall command had an invalid executable path.'
     }
     if ([string]::IsNullOrWhiteSpace($extension) -or $extension.ToLowerInvariant() -cne '.exe' -or -not [IO.File]::Exists($filePath)) {
-        Stop-Bootstrap 'The registered Pi Agent uninstall command did not point to an existing executable file.'
+        Stop-Bootstrap 'The registered OMP Agent uninstall command did not point to an existing executable file.'
     }
 
 
@@ -580,18 +591,18 @@ function Get-CanonicalUninstallerPath {
         $expectedItem = Get-Item -LiteralPath $expectedPath -Force -ErrorAction Stop
         $parsedItem = Get-Item -LiteralPath $ParsedCommand.FilePath -Force -ErrorAction Stop
         if ($expectedItem.PSIsContainer -or $parsedItem.PSIsContainer) {
-            Stop-Bootstrap 'The registered Pi Agent uninstaller was not a regular file.'
+            Stop-Bootstrap 'The registered OMP Agent uninstaller was not a regular file.'
         }
         if (($expectedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or ($parsedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            Stop-Bootstrap 'The registered Pi Agent uninstaller was a reparse point.'
+            Stop-Bootstrap 'The registered OMP Agent uninstaller was a reparse point.'
         }
         if ([String]::Compare($expectedItem.FullName, $parsedItem.FullName, [StringComparison]::OrdinalIgnoreCase) -ne 0) {
-            Stop-Bootstrap 'The registered Pi Agent uninstall command did not point to the exact per-user uninstaller.'
+            Stop-Bootstrap 'The registered OMP Agent uninstall command did not point to the exact per-user uninstaller.'
         }
         return $expectedItem.FullName
     }
     catch {
-        Stop-Bootstrap "The registered Pi Agent uninstaller could not be validated: $($_.Exception.Message)"
+        Stop-Bootstrap "The registered OMP Agent uninstaller could not be validated: $($_.Exception.Message)"
     }
 }
 function Invoke-Executable {
@@ -645,14 +656,12 @@ function Assert-WindowsX64 {
 
 
 
-function Invoke-Uninstall {
-    Assert-WindowsX64
-    $entry = Get-SinglePiAgentEntry -Purpose 'uninstall Pi Agent'
-    if ($null -eq $entry) {
-        Write-Output 'Pi Agent is not installed for the current user.'
-        return
-    }
-
+function Invoke-RegisteredUninstaller {
+    param(
+        [Parameter(Mandatory = $true)]$Entry,
+        [Parameter(Mandatory = $true)][string]$DisplayName
+    )
+    $entry = $Entry
     $command = if (-not [string]::IsNullOrWhiteSpace($entry.QuietUninstallString)) {
         $entry.QuietUninstallString
     }
@@ -660,22 +669,22 @@ function Invoke-Uninstall {
         $entry.UninstallString
     }
     if ([string]::IsNullOrWhiteSpace($command)) {
-        Stop-Bootstrap 'The current-user Pi Agent uninstall entry had neither QuietUninstallString nor UninstallString.'
+        Stop-Bootstrap 'The current-user OMP Agent uninstall entry had neither QuietUninstallString nor UninstallString.'
     }
 
     $parsed = Split-UninstallCommand -CommandLine $command
     $uninstallerPath = Get-CanonicalUninstallerPath -Entry $entry -ParsedCommand $parsed
-    $exitCode = Invoke-Executable -FilePath $uninstallerPath -Arguments '/S' -Purpose 'registered Pi Agent uninstaller'
+    $exitCode = Invoke-Executable -FilePath $uninstallerPath -Arguments '/S' -Purpose 'registered OMP Agent uninstaller'
     if ($exitCode -ne 0) {
-        Stop-Bootstrap "The registered Pi Agent uninstaller failed with exit code $exitCode."
+        Stop-Bootstrap "The registered $DisplayName uninstaller failed with exit code $exitCode."
     }
 
     $deadline = [System.Diagnostics.Stopwatch]::GetTimestamp() + ([System.Diagnostics.Stopwatch]::Frequency * 60)
     $remaining = @()
     do {
-        $remaining = @(Get-PiAgentUninstallEntries)
+        $remaining = @(Get-PiAgentUninstallEntries -DisplayName $DisplayName)
         if ($remaining.Count -eq 0) {
-            Write-Output 'Pi Agent was uninstalled for the current user.'
+            Write-Output "$DisplayName was uninstalled for the current user."
             return
         }
         if ([System.Diagnostics.Stopwatch]::GetTimestamp() -ge $deadline) {
@@ -684,19 +693,59 @@ function Invoke-Uninstall {
         Start-Sleep -Milliseconds 250
     } while ($true)
     if ($remaining.Count -gt 1) {
-        Stop-Bootstrap 'The registered uninstaller completed but multiple current-user Pi Agent uninstall entries remain.'
+        Stop-Bootstrap "The registered uninstaller completed but multiple current-user $DisplayName uninstall entries remain."
     }
-    Stop-Bootstrap 'The registered uninstaller completed but the current-user Pi Agent uninstall entry remains.'
+    Stop-Bootstrap "The registered uninstaller completed but the current-user $DisplayName uninstall entry remains."
+}
+
+# Runs after a verified install. The silent NSIS uninstaller only purges
+# %APPDATA%/%LOCALAPPDATA%\<bundle id> when its interactive checkbox is set, so
+# removing the superseded product leaves the shared user data in place. A
+# superseded entry that cannot be removed is reported, never fatal.
+function Remove-LegacyInstallations {
+    foreach ($legacyName in $LegacyProductNames) {
+        try {
+            $entries = @(Get-PiAgentUninstallEntries -DisplayName $legacyName)
+            if ($entries.Count -eq 0) {
+                continue
+            }
+            if ($entries.Count -ne 1) {
+                throw "found $($entries.Count) current-user uninstall entries"
+            }
+            $entry = $entries[0]
+            if ([string]::IsNullOrWhiteSpace($entry.InstallLocation)) {
+                throw 'the uninstall entry had no InstallLocation'
+            }
+            [void]($entry.InstallLocation = (Get-CanonicalInstallLocation -Value $entry.InstallLocation -DisplayName $legacyName))
+            Write-Output "Removing superseded $legacyName installation."
+            Invoke-RegisteredUninstaller -Entry $entry -DisplayName $legacyName
+        }
+        catch {
+            Write-Warning "Left the superseded $legacyName installation in place; remove it from Windows Settings manually: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Invoke-Uninstall {
+    Assert-WindowsX64
+    $entry = Get-SinglePiAgentEntry -Purpose 'uninstall OMP Agent'
+    if ($null -ne $entry) {
+        Invoke-RegisteredUninstaller -Entry $entry -DisplayName $ProductName
+    }
+    else {
+        Write-Output 'OMP Agent is not installed for the current user.'
+    }
+    Remove-LegacyInstallations
 }
 
 function Invoke-Status {
     Assert-WindowsX64
     $entry = Get-SinglePiAgentEntry -Purpose 'read status'
     if ($null -eq $entry) {
-        Write-Output 'Pi Agent is not installed for the current user.'
+        Write-Output 'OMP Agent is not installed for the current user.'
         return
     }
-    Write-Output "Pi Agent version $($entry.DisplayVersion)"
+    Write-Output "OMP Agent version $($entry.DisplayVersion)"
 }
 
 if ($Action -ne 'install' -and $PSBoundParameters.ContainsKey('Channel')) {

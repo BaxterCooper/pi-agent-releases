@@ -1,6 +1,8 @@
-# Pi Agent desktop releases
+# OMP Agent desktop releases
 
-This public repository contains the release assets and update manifests for the Pi Agent desktop app.
+This public repository contains the release assets and update manifests for the OMP Agent desktop app (bundle identifier `dev.baxter.pi-agent`; releases before 0.3.0 were published under the name Pi Agent).
+
+`install.sh` and `install.ps1` are mirrored from `BaxterCooper/pi-agent` (`apps/desktop/bootstrap/`) by the desktop release workflow on every tag. Edit them there; edits made here are overwritten by the next release.
 
 ## Install
 
@@ -64,12 +66,12 @@ bash ./install.sh uninstall              # macOS
 powershell.exe -NoProfile -File .\install.ps1 uninstall  # Windows
 ```
 
-The macOS bootstrap removes only `~/Applications/Pi Agent.app`, and refuses to remove it unless its readable bundle identity is `dev.baxter.pi-agent` with a semantic version. The Windows bootstrap invokes only the single exact `Pi Agent` uninstall entry registered for the current user; shell and script command registrations are refused.
+The macOS bootstrap removes only `~/Applications/OMP Agent.app` (plus a superseded `~/Applications/Pi Agent.app`), and refuses to remove either unless its readable bundle identity is `dev.baxter.pi-agent` with a semantic version. The Windows bootstrap invokes only the single exact `OMP Agent` uninstall entry registered for the current user (plus a superseded `Pi Agent` entry); shell and script command registrations are refused.
 
 ## Supported platforms and paths
 
 - **Windows:** AMD64/x64 only, using the NSIS `.exe` asset. x86, ARM64, and non-Windows systems fail closed. The NSIS install and uninstall registration stay in the current user's profile/HKCU; no elevation is requested.
-- **macOS:** Apple Silicon ARM64 only, using the `_aarch64.dmg` asset. A process running under Rosetta is accepted only when macOS reports real ARM64 translation; Intel Macs are rejected. The app is staged, backed up, replaced, and verified under `~/Applications` on the same volume.
+- **macOS:** Apple Silicon ARM64 only, using the `_aarch64.dmg` asset. A process running under Rosetta is accepted only when macOS reports real ARM64 translation; Intel Macs are rejected. The application bundle inside the DMG is located by bundle identifier, then staged, backed up, replaced as `OMP Agent.app`, and verified under `~/Applications` on the same volume.
 - **Other systems:** unsupported and rejected rather than falling back to another artifact.
 
 ## Release and integrity checks
