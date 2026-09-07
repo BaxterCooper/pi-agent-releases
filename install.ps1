@@ -293,7 +293,7 @@ function Get-Release {
         Stop-Bootstrap 'The selected installer asset did not contain a valid name.'
     }
     $installerName = [string]$installerNameValue
-    if ($installerSizeValue -eq $null -or ([string]$installerSizeValue -notmatch '^[0-9]+$')) {
+    if ($null -eq $installerSizeValue -or ([string]$installerSizeValue -notmatch '^[0-9]+$')) {
         Stop-Bootstrap "Installer asset '$installerName' had no valid declared size."
     }
     try {
