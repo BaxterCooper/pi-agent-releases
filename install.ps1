@@ -6,11 +6,43 @@ param(
     [string]$Action = 'install',
 
     [Parameter(Position = 1)]
-    [string]$Channel = 'stable'
+    [string]$Channel = 'stable',
+
+    [switch]$AllowDowngrade
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# Windows PowerShell 5.1 on an older .NET defaults to SSL3/TLS 1.0, which
+# github.com refuses; opt in explicitly rather than failing at the first request.
+# PowerShell 7 defaults to SystemDefault, which already negotiates TLS 1.2/1.3
+# and honours OS policy; pinning protocols there would only remove choices.
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    $protocols = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    if ([Enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13') {
+        $protocols = $protocols -bor [Net.SecurityProtocolType]::Tls13
+    }
+    [Net.ServicePointManager]::SecurityProtocol = $protocols
+}
+
+# No transfer may exceed this; the release installer is far smaller.
+$MaxDownloadBytes = 536870912
+
+# Trust anchor. The release workflow rewrites the table below when it mirrors
+# this file to BaxterCooper/pi-agent-releases, so the copy a user runs carries
+# the SHA-256 of every asset of every release it can install. The published
+# `.sha256` sidecar travels with the installer and is only a secondary
+# consistency check; it cannot attest to the installer it accompanies.
+# BEGIN PINNED
+# v0.3.3 OMP.Agent.app.tar.gz 097b1ce49e65a6f212ce822129548f1f6d46c66de04a2e59f1589d03ec5c32e3
+# v0.3.3 OMP.Agent.app.tar.gz.sig d146856b5a152e07edfcda6bc99ce11bf6a14f989827d5977bdde127e6790dca
+# v0.3.3 OMP.Agent_0.3.3_aarch64.dmg 435b92c485f6e42582999169ade34ea3b7ad32ac3d9051f16b3f7029dc7a0740
+# v0.3.3 OMP.Agent_0.3.3_aarch64.dmg.sha256 324a27f088849c142f2b057ce9059ca42d3d6f8759d1196ea3e7ce7038ad2806
+# v0.3.3 OMP.Agent_0.3.3_x64-setup.exe 8fe8777c4d3d8b1ab61c31074820123c0732fe9a1a3d49eed8af5bd466544a35
+# v0.3.3 OMP.Agent_0.3.3_x64-setup.exe.sha256 e2babee57883a3b2767ecaccb2fcbb97cbc9f9ac2f11961c6a04bb0d6f9d05cb
+# v0.3.3 OMP.Agent_0.3.3_x64-setup.exe.sig 894b036783a59d851e022ad49f27c8ddbbb580eb962e969151aaa931f256fd94
+# END PINNED
 
 # Generated source: BaxterCooper/pi-agent apps/desktop/bootstrap/install.ps1. The
 # desktop release workflow publishes this file to BaxterCooper/pi-agent-releases.
@@ -20,6 +52,13 @@ $ProductName = 'OMP Agent'
 # renamed product leaves the previous registration installed beside the new one.
 $LegacyProductNames = @('Pi Agent')
 $TempRoot = $null
+# The app bundles no Bun and no OMP: it runs the bundled engine with the user's
+# Bun against their global `@oh-my-pi/pi-coding-agent`, and fails to launch
+# without both (`src-tauri/src/omp_install.rs`). The bootstrap provisions them.
+# $OmpRange mirrors the `@oh-my-pi/pi-coding-agent` dependency in
+# `packages/engine/package.json`; the two must stay equal.
+$OmpPackage = '@oh-my-pi/pi-coding-agent'
+$OmpRange = '^18.1.17'
 
 function Stop-Bootstrap {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -70,6 +109,29 @@ function Assert-HttpsUri {
 
     if (-not $uri.IsAbsoluteUri -or $uri.Scheme -cne 'https' -or [string]::IsNullOrWhiteSpace($uri.Host) -or -not [string]::IsNullOrEmpty($uri.UserInfo)) {
         Stop-Bootstrap "$Label must be an HTTPS URL without embedded credentials."
+    }
+}
+
+# A prefix match alone is not a pin: `.../download/v1.2.3/../../other/asset` and
+# its percent-encoded spellings still start with the prefix but resolve
+# elsewhere. Require the remainder to be exactly one literal asset segment.
+function Assert-PinnedDownloadUri {
+    param(
+        [Parameter(Mandatory = $true)][string]$Value,
+        [Parameter(Mandatory = $true)][string]$Prefix,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    if (-not $Value.StartsWith($Prefix, [StringComparison]::Ordinal)) {
+        Stop-Bootstrap "$Label was not published under $Prefix."
+    }
+    $afterScheme = $Value -replace '^[A-Za-z][A-Za-z0-9+.-]*://', ''
+    if ($afterScheme.Contains('..') -or $afterScheme.Contains('//') -or $Value -match '(?i)%2e|%2f') {
+        Stop-Bootstrap "$Label contained a traversal, empty path segment or encoded separator."
+    }
+    $remainder = $Value.Substring($Prefix.Length)
+    if ($remainder -cnotmatch '^[A-Za-z0-9._-]+$') {
+        Stop-Bootstrap "$Label did not resolve to a single asset name under $Prefix."
     }
 }
 
@@ -192,6 +254,10 @@ function Invoke-HttpsDownload {
                 }
 
                 try {
+                    $declaredLength = $response.Content.Headers.ContentLength
+                    if ($null -ne $declaredLength -and [Int64]$declaredLength -gt $MaxDownloadBytes) {
+                        Stop-Bootstrap "The download from '$current' declares $declaredLength bytes, above the $MaxDownloadBytes byte ceiling."
+                    }
                     $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
                     $fileStream = [IO.File]::Open($Destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
                     $destinationCreated = $true
@@ -305,6 +371,9 @@ function Get-Release {
     if ($installerSize -le 0) {
         Stop-Bootstrap "Installer asset '$installerName' had no positive declared size."
     }
+    if ($installerSize -gt $MaxDownloadBytes) {
+        Stop-Bootstrap "Installer asset '$installerName' declares $installerSize bytes, above the $MaxDownloadBytes byte ceiling."
+    }
 
     $sidecarAssets = @($assets | Where-Object {
         $nameValue = Get-PropertyValue -Object $_ -Name 'name'
@@ -323,6 +392,12 @@ function Get-Release {
     $sidecarUrl = [string]$sidecarUrlValue
     Assert-HttpsUri -Value $installerUrl -Label "Installer asset '$installerName'"
     Assert-HttpsUri -Value $sidecarUrl -Label "Checksum sidecar '$installerName.sha256'"
+
+    # The release contract publishes assets under exactly one prefix; anything
+    # else in the JSON is a redirected or substituted host, not this release.
+    $downloadPrefix = "https://github.com/BaxterCooper/pi-agent-releases/releases/download/$tag/"
+    Assert-PinnedDownloadUri -Value $installerUrl -Prefix $downloadPrefix -Label "Installer asset '$installerName'"
+    Assert-PinnedDownloadUri -Value $sidecarUrl -Prefix $downloadPrefix -Label "Checksum sidecar '$installerName.sha256'"
 
     return [pscustomobject]@{
         Tag = $tag
@@ -384,9 +459,229 @@ function Assert-ChecksumSidecar {
         }
     }
 }
+function Assert-PinnedAsset {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Tag,
+        [Parameter(Mandatory = $true)][string]$AssetName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PSCommandPath) -or -not (Test-Path -LiteralPath $PSCommandPath -PathType Leaf)) {
+        Stop-Bootstrap 'Could not read this script to load its pinned release table.'
+    }
+    $lines = @(Get-Content -LiteralPath $PSCommandPath)
+    $begin = [Array]::IndexOf($lines, '# BEGIN PINNED')
+    $end = [Array]::IndexOf($lines, '# END PINNED')
+    if ($begin -lt 0 -or $end -le $begin) {
+        Stop-Bootstrap 'This script carries no pinned release table; use the copy published in BaxterCooper/pi-agent-releases.'
+    }
+    $expected = $null
+    for ($index = $begin + 1; $index -lt $end; $index++) {
+        $fields = @(([string]$lines[$index]).Trim() -split '\s+')
+        if ($fields.Count -ne 4 -or $fields[0] -cne '#' -or $fields[1] -cne $Tag -or $fields[2] -cne $AssetName) {
+            continue
+        }
+        if ($fields[3] -cnotmatch '^[0-9a-f]{64}$') {
+            Stop-Bootstrap "The pinned entry for '$AssetName' in $Tag is malformed."
+        }
+        $expected = [string]$fields[3]
+        break
+    }
+    if ($null -eq $expected) {
+        Stop-Bootstrap "Release $Tag pins no SHA-256 for '$AssetName' in this script; refusing to install an unpinned build."
+    }
+    if ((Get-Sha256 -Path $Path) -cne $expected) {
+        Stop-Bootstrap "The downloaded '$AssetName' did not match the SHA-256 pinned for $Tag."
+    }
+}
+
+function Get-VersionRank {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    $core = @((($Value -split '\+', 2)[0]) -split '-', 2)
+    $numbers = @(([string]$core[0]) -split '\.')
+    if ($numbers.Count -ne 3) {
+        return $null
+    }
+    $rank = New-Object 'System.Collections.Generic.List[int]'
+    foreach ($number in $numbers) {
+        if ([string]$number -cnotmatch '^(0|[1-9][0-9]*)$') {
+            return $null
+        }
+        $rank.Add([int]$number)
+    }
+    $prerelease = @()
+    if ($core.Count -gt 1 -and -not [string]::IsNullOrEmpty([string]$core[1])) {
+        $prerelease = @(([string]$core[1]) -split '\.')
+        foreach ($identifier in $prerelease) {
+            if ([string]$identifier -cnotmatch '^[0-9A-Za-z-]+$') {
+                return $null
+            }
+        }
+    }
+    return [pscustomobject]@{
+        Core = $rank.ToArray()
+        Prerelease = $prerelease
+    }
+}
+
+# SemVer 11.4: numeric identifiers compare numerically, alphanumerics compare in
+# ASCII order, and a numeric identifier always sorts below an alphanumeric one.
+function Compare-PrereleaseIdentifier {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Left,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Right
+    )
+
+    $leftNumeric = $Left -cmatch '^[0-9]+$'
+    $rightNumeric = $Right -cmatch '^[0-9]+$'
+    if ($leftNumeric -and $rightNumeric) {
+        $first = [decimal]$Left
+        $second = [decimal]$Right
+        if ($first -eq $second) {
+            return 0
+        }
+        return $(if ($first -gt $second) { 1 } else { -1 })
+    }
+    if ($leftNumeric) {
+        return -1
+    }
+    if ($rightNumeric) {
+        return 1
+    }
+    $ordinal = [string]::CompareOrdinal($Left, $Right)
+    if ($ordinal -eq 0) {
+        return 0
+    }
+    return $(if ($ordinal -gt 0) { 1 } else { -1 })
+}
+
+function Compare-SemanticVersion {
+    param(
+        [Parameter(Mandatory = $true)][string]$Left,
+        [Parameter(Mandatory = $true)][string]$Right
+    )
+
+    $first = Get-VersionRank -Value $Left
+    $second = Get-VersionRank -Value $Right
+    # Fail closed: a version this installer cannot rank is not proof that the
+    # release is newer, so treat it as a downgrade and demand -AllowDowngrade.
+    if ($null -eq $first -or $null -eq $second) {
+        return 1
+    }
+    for ($index = 0; $index -lt $first.Core.Length; $index++) {
+        if ($first.Core[$index] -ne $second.Core[$index]) {
+            return $(if ($first.Core[$index] -gt $second.Core[$index]) { 1 } else { -1 })
+        }
+    }
+    $leftPrerelease = @($first.Prerelease)
+    $rightPrerelease = @($second.Prerelease)
+    # A prerelease sorts below the release with the same core version.
+    if ($leftPrerelease.Count -eq 0 -or $rightPrerelease.Count -eq 0) {
+        if ($leftPrerelease.Count -eq $rightPrerelease.Count) {
+            return 0
+        }
+        return $(if ($leftPrerelease.Count -eq 0) { 1 } else { -1 })
+    }
+    $shared = [Math]::Min($leftPrerelease.Count, $rightPrerelease.Count)
+    for ($index = 0; $index -lt $shared; $index++) {
+        $order = Compare-PrereleaseIdentifier -Left ([string]$leftPrerelease[$index]) -Right ([string]$rightPrerelease[$index])
+        if ($order -ne 0) {
+            return $order
+        }
+    }
+    if ($leftPrerelease.Count -eq $rightPrerelease.Count) {
+        return 0
+    }
+    return $(if ($leftPrerelease.Count -gt $rightPrerelease.Count) { 1 } else { -1 })
+}
+
+# The launcher's own search order (`omp_install.rs:67-78`): `$BUN_INSTALL\bin`
+# first, because a GUI launch inherits a PATH that often predates the install.
+function Find-BunExecutable {
+    $candidates = @()
+    if ($env:BUN_INSTALL) { $candidates += (Join-Path $env:BUN_INSTALL 'bin\bun.exe') }
+    $onPath = @(Get-Command -Name 'bun.exe' -CommandType Application -ErrorAction SilentlyContinue)
+    if ($onPath.Count -gt 0) { $candidates += [string]$onPath[0].Source }
+    if ($env:USERPROFILE) { $candidates += (Join-Path $env:USERPROFILE '.bun\bin\bun.exe') }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+    return $null
+}
+
+# The global root the launcher links the engine against
+# (`omp_install.rs:117-130`), read straight from the installed manifest.
+function Get-InstalledOmpVersion {
+    param([Parameter(Mandatory = $true)][string]$BunPath)
+
+    $roots = @()
+    if ($env:BUN_INSTALL) { $roots += $env:BUN_INSTALL }
+    if ($env:USERPROFILE) { $roots += (Join-Path $env:USERPROFILE '.bun') }
+    $roots += [string](Split-Path -Parent (Split-Path -Parent $BunPath))
+    foreach ($root in $roots) {
+        if ([string]::IsNullOrWhiteSpace($root)) { continue }
+        $manifest = Join-Path $root ('install\global\node_modules\' + $OmpPackage.Replace('/', '\') + '\package.json')
+        if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { continue }
+        $found = [regex]::Match((Get-Content -LiteralPath $manifest -Raw), '"version"\s*:\s*"([^"]+)"')
+        if ($found.Success -and (Test-SemanticVersion -Value $found.Groups[1].Value)) {
+            return $found.Groups[1].Value
+        }
+    }
+    return $null
+}
+
+# `^MAJOR.MINOR.PATCH`: at or above the pin and below the next major.
+function Test-OmpVersionInRange {
+    param([Parameter(Mandatory = $true)][string]$Version)
+
+    $minimum = $OmpRange.TrimStart('^')
+    if (($Version -split '\.')[0] -cne ($minimum -split '\.')[0]) { return $false }
+    return (Compare-SemanticVersion -Left $Version -Right $minimum) -ge 0
+}
+
+# Idempotent: an existing Bun and an in-range OMP are left exactly as they are.
+function Install-LaunchPrerequisite {
+    $bun = Find-BunExecutable
+    if ($null -eq $bun) {
+        Write-Output 'Installing Bun, which the OMP Agent launcher requires.'
+        $bunExit = Invoke-Executable -FilePath 'powershell.exe' `
+            -Arguments '-NoProfile -ExecutionPolicy Bypass -Command "irm bun.sh/install.ps1|iex"' `
+            -Purpose 'Bun installer'
+        if ($bunExit -ne 0) {
+            Stop-Bootstrap "The Bun installer failed with exit code $bunExit; install Bun and re-run."
+        }
+        $bun = Find-BunExecutable
+        if ($null -eq $bun) { Stop-Bootstrap 'Bun is still not installed; install Bun and re-run.' }
+    }
+    $version = Get-InstalledOmpVersion -BunPath $bun
+    if ($null -ne $version -and (Test-OmpVersionInRange -Version $version)) { return }
+    Write-Output "Installing $OmpPackage@$OmpRange, which the OMP Agent launcher requires."
+    $exitCode = Invoke-Executable -FilePath $bun -Arguments "add -g `"$OmpPackage@$OmpRange`"" -Purpose 'OMP package installer'
+    if ($exitCode -ne 0) {
+        Stop-Bootstrap "Could not install $OmpPackage@$OmpRange; run 'bun add -g $OmpPackage@$OmpRange' and re-run."
+    }
+    $version = Get-InstalledOmpVersion -BunPath $bun
+    if ($null -eq $version -or -not (Test-OmpVersionInRange -Version $version)) {
+        Stop-Bootstrap "$OmpPackage@$OmpRange is not installed under the Bun global root; the app cannot start without it."
+    }
+}
+
 function Invoke-Install {
     Assert-WindowsX64
+    # Before anything is downloaded or replaced: an app that cannot find Bun
+    # and a global OMP installs cleanly and then fails at launch.
+    Install-LaunchPrerequisite
     $release = Get-Release -RequestedChannel $Channel
+
+    # An older tag surfacing as the resolved release must not silently replace a
+    # patched build; require an explicit choice to go backwards.
+    if (-not $AllowDowngrade) {
+        $installed = Get-SinglePiAgentEntry -Purpose 'compare the installed version' -Optional
+        if ($null -ne $installed -and (Compare-SemanticVersion -Left ([string]$installed.DisplayVersion) -Right $release.Version) -gt 0) {
+            Stop-Bootstrap "Installed $ProductName $($installed.DisplayVersion) is newer than release $($release.Version); re-run with -AllowDowngrade to replace it."
+        }
+    }
 
     $script:TempRoot = Join-Path ([IO.Path]::GetTempPath()) ("pi-agent-bootstrap-" + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $script:TempRoot -Force | Out-Null
@@ -404,6 +699,7 @@ function Invoke-Install {
         if ($downloadedSize -ne $release.InstallerSize) {
             Stop-Bootstrap "Downloaded installer size $downloadedSize did not match the release-declared size $($release.InstallerSize)."
         }
+        Assert-PinnedAsset -Path $installerPath -Tag $release.Tag -AssetName $release.InstallerName
         Assert-ChecksumSidecar -InstallerPath $installerPath -SidecarPath $sidecarPath -InstallerName $release.InstallerName
 
         $exitCode = Invoke-Executable -FilePath $installerPath -Arguments '/S' -Purpose 'OMP Agent installer'
@@ -506,23 +802,49 @@ function Get-CanonicalInstallLocation {
         Stop-Bootstrap "The current-user $DisplayName InstallLocation could not be validated: $($_.Exception.Message)"
     }
 }
+# `-Optional` reports a malformed or ambiguous registration as absent instead of
+# aborting: a broken leftover entry must not stop a fresh install from running.
+# Callers that act on the entry itself leave it off and keep the hard failure.
 function Get-SinglePiAgentEntry {
-    param([Parameter(Mandatory = $true)][string]$Purpose)
+    param(
+        [Parameter(Mandatory = $true)][string]$Purpose,
+        [switch]$Optional
+    )
 
+    $reject = {
+        param([string]$Message)
+        if ($Optional) {
+            Write-Warning "Ignoring the current-user OMP Agent registration: $Message"
+            return
+        }
+        Stop-Bootstrap $Message
+    }
     $entries = @(Get-PiAgentUninstallEntries)
     if ($entries.Count -eq 0) {
         return $null
     }
     if ($entries.Count -ne 1) {
-        Stop-Bootstrap "Found multiple current-user OMP Agent uninstall entries while attempting to $Purpose."
+        & $reject "Found multiple current-user OMP Agent uninstall entries while attempting to $Purpose."
+        return $null
     }
     if ([string]::IsNullOrWhiteSpace($entries[0].DisplayVersion) -or -not (Test-SemanticVersion -Value $entries[0].DisplayVersion)) {
-        Stop-Bootstrap "The current-user OMP Agent uninstall entry had no valid semantic DisplayVersion while attempting to $Purpose."
+        & $reject "The current-user OMP Agent uninstall entry had no valid semantic DisplayVersion while attempting to $Purpose."
+        return $null
     }
     if ([string]::IsNullOrWhiteSpace($entries[0].InstallLocation)) {
-        Stop-Bootstrap "The current-user OMP Agent uninstall entry had no InstallLocation while attempting to $Purpose."
+        & $reject "The current-user OMP Agent uninstall entry had no InstallLocation while attempting to $Purpose."
+        return $null
     }
-    $canonicalInstallLocation = Get-CanonicalInstallLocation -Value $entries[0].InstallLocation
+    try {
+        $canonicalInstallLocation = Get-CanonicalInstallLocation -Value $entries[0].InstallLocation
+    }
+    catch {
+        if (-not $Optional) {
+            throw
+        }
+        Write-Warning "Ignoring the current-user OMP Agent registration: $($_.Exception.Message)"
+        return $null
+    }
     [void]($entries[0].InstallLocation = $canonicalInstallLocation)
     return $entries[0]
 }

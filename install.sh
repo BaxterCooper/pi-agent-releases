@@ -5,11 +5,39 @@ export LC_ALL=C
 # Generated source: BaxterCooper/pi-agent apps/desktop/bootstrap/install.sh. The
 # desktop release workflow publishes this file to BaxterCooper/pi-agent-releases.
 API_ROOT='https://api.github.com/repos/BaxterCooper/pi-agent-releases'
+# Assets are published under exactly this prefix plus the tag.
+DOWNLOAD_PREFIX='https://github.com/BaxterCooper/pi-agent-releases/releases/download'
+MAX_DOWNLOAD_BYTES=536870912
+
+# Trust anchor. The release workflow rewrites the table below when it mirrors
+# this file to BaxterCooper/pi-agent-releases, so the copy a user runs carries
+# the SHA-256 of every asset of every release it can install. The published
+# `.sha256` sidecar travels with the installer and is only a secondary
+# consistency check; it cannot attest to the installer it accompanies.
+# BEGIN PINNED
+# v0.3.3 OMP.Agent.app.tar.gz 097b1ce49e65a6f212ce822129548f1f6d46c66de04a2e59f1589d03ec5c32e3
+# v0.3.3 OMP.Agent.app.tar.gz.sig d146856b5a152e07edfcda6bc99ce11bf6a14f989827d5977bdde127e6790dca
+# v0.3.3 OMP.Agent_0.3.3_aarch64.dmg 435b92c485f6e42582999169ade34ea3b7ad32ac3d9051f16b3f7029dc7a0740
+# v0.3.3 OMP.Agent_0.3.3_aarch64.dmg.sha256 324a27f088849c142f2b057ce9059ca42d3d6f8759d1196ea3e7ce7038ad2806
+# v0.3.3 OMP.Agent_0.3.3_x64-setup.exe 8fe8777c4d3d8b1ab61c31074820123c0732fe9a1a3d49eed8af5bd466544a35
+# v0.3.3 OMP.Agent_0.3.3_x64-setup.exe.sha256 e2babee57883a3b2767ecaccb2fcbb97cbc9f9ac2f11961c6a04bb0d6f9d05cb
+# v0.3.3 OMP.Agent_0.3.3_x64-setup.exe.sig 894b036783a59d851e022ad49f27c8ddbbb580eb962e969151aaa931f256fd94
+# END PINNED
 BUNDLE_ID='dev.baxter.pi-agent'
 # Bundle names installed by earlier bootstraps under the same bundle identifier.
 LEGACY_APP_NAMES=('Pi Agent.app')
+# The app bundles no Bun and no OMP: it runs the bundled engine with the user's
+# Bun against their global `@oh-my-pi/pi-coding-agent`, and fails to launch
+# without both (`src-tauri/src/omp_install.rs`). The bootstrap provisions them.
+# OMP_RANGE mirrors the `@oh-my-pi/pi-coding-agent` dependency in
+# `packages/engine/package.json`; the two must stay equal.
+OMP_PACKAGE='@oh-my-pi/pi-coding-agent'
+OMP_RANGE='^18.1.17'
+BUN_INSTALLER_URL='https://bun.sh/install'
+BUN_BIN=''
 ACTION='install'
 CHANNEL='stable'
+ALLOW_DOWNGRADE=0
 TEMP_ROOT=''
 MOUNT_ROOT=''
 ATTACH_PLIST=''
@@ -39,9 +67,10 @@ fail() {
 
 usage() {
   printf '%s\n' \
-    'Usage: install.sh [install [stable|latest|VERSION] | uninstall | status]' \
+    'Usage: install.sh [--allow-downgrade] [install [stable|latest|VERSION] | uninstall | status]' \
     '' \
-    'Install is the default action. VERSION must be an exact semantic version such as 1.2.3.'
+    'Install is the default action. VERSION must be an exact semantic version such as 1.2.3.' \
+    '--allow-downgrade replaces a newer installed bundle with an older release.'
 }
 
 cleanup() {
@@ -139,6 +168,24 @@ assert_supported_macos_arm64() {
 }
 
 parse_args() {
+  local positional=()
+  local argument
+
+  for argument in "$@"; do
+    case "$argument" in
+      --allow-downgrade)
+        ALLOW_DOWNGRADE=1
+        ;;
+      -*)
+        usage >&2
+        fail "Unknown option '$argument'."
+        ;;
+      *)
+        positional[${#positional[@]}]=$argument
+        ;;
+    esac
+  done
+  set -- ${positional+"${positional[@]}"}
   case "$#" in
     0)
       ACTION='install'
@@ -179,12 +226,237 @@ is_semver() {
   [ "$#" -eq 1 ] && [[ "$1" =~ $SEMVER_RE ]]
 }
 
+# Compare two semantic versions. Prints -1, 0 or 1 when the left version is
+# lower than, equal to or higher than the right one. Build metadata is ignored
+# and a prerelease sorts below the release that carries the same core version.
+semver_compare() {
+  local left=${1%%+*}
+  local right=${2%%+*}
+  local left_core=${left%%-*}
+  local right_core=${right%%-*}
+  local left_pre=''
+  local right_pre=''
+  local l1 l2 l3 r1 r2 r3
+  local left_field right_field
+  local index=1
+
+  case "$left" in *-*) left_pre=${left#*-} ;; esac
+  case "$right" in *-*) right_pre=${right#*-} ;; esac
+  IFS='.' read -r l1 l2 l3 <<< "$left_core"
+  IFS='.' read -r r1 r2 r3 <<< "$right_core"
+  for index in "$l1:$r1" "$l2:$r2" "$l3:$r3"; do
+    left_field=${index%%:*}
+    right_field=${index#*:}
+    if [ "$left_field" -lt "$right_field" ]; then
+      printf '%s\n' '-1'
+      return 0
+    fi
+    if [ "$left_field" -gt "$right_field" ]; then
+      printf '%s\n' '1'
+      return 0
+    fi
+  done
+  if [ -z "$left_pre" ] && [ -z "$right_pre" ]; then
+    printf '%s\n' '0'
+    return 0
+  fi
+  if [ -z "$left_pre" ]; then
+    printf '%s\n' '1'
+    return 0
+  fi
+  if [ -z "$right_pre" ]; then
+    printf '%s\n' '-1'
+    return 0
+  fi
+  prerelease_compare "$left_pre" "$right_pre"
+}
+
+# SemVer 11.4: prerelease identifiers compare field by field; numeric fields
+# compare numerically, alphanumeric fields in ASCII order, a numeric field sorts
+# below an alphanumeric one, and a longer identifier list wins a shared prefix.
+prerelease_compare() {
+  local left_rest=$1
+  local right_rest=$2
+  local left_field right_field left_numeric right_numeric left_value right_value
+
+  while [ -n "$left_rest" ] || [ -n "$right_rest" ]; do
+    if [ -z "$left_rest" ]; then
+      printf '%s\n' '-1'
+      return 0
+    fi
+    if [ -z "$right_rest" ]; then
+      printf '%s\n' '1'
+      return 0
+    fi
+    left_field=${left_rest%%.*}
+    right_field=${right_rest%%.*}
+    case "$left_rest" in *.*) left_rest=${left_rest#*.} ;; *) left_rest='' ;; esac
+    case "$right_rest" in *.*) right_rest=${right_rest#*.} ;; *) right_rest='' ;; esac
+    if [ "$left_field" = "$right_field" ]; then
+      continue
+    fi
+    left_numeric=1
+    right_numeric=1
+    case "$left_field" in ''|*[!0-9]*) left_numeric=0 ;; esac
+    case "$right_field" in ''|*[!0-9]*) right_numeric=0 ;; esac
+    if [ "$left_numeric" -eq 1 ] && [ "$right_numeric" -eq 1 ]; then
+      left_value=$(normalize_decimal "$left_field")
+      right_value=$(normalize_decimal "$right_field")
+      if [ "$left_value" -eq "$right_value" ]; then
+        continue
+      fi
+      if [ "$left_value" -lt "$right_value" ]; then
+        printf '%s\n' '-1'
+      else
+        printf '%s\n' '1'
+      fi
+      return 0
+    fi
+    if [ "$left_numeric" -eq 1 ]; then
+      printf '%s\n' '-1'
+      return 0
+    fi
+    if [ "$right_numeric" -eq 1 ]; then
+      printf '%s\n' '1'
+      return 0
+    fi
+    if [ "$left_field" \< "$right_field" ]; then
+      printf '%s\n' '-1'
+    else
+      printf '%s\n' '1'
+    fi
+    return 0
+  done
+  printf '%s\n' '0'
+}
+
+# The launcher's own search order (`omp_install.rs:67-78`): `$BUN_INSTALL/bin`
+# first, because a GUI launch inherits a PATH that often predates the install.
+find_bun() {
+  local candidate
+
+  for candidate in ${BUN_INSTALL:+"$BUN_INSTALL/bin/bun"} "$HOME/.bun/bin/bun" '/opt/homebrew/bin/bun' '/usr/local/bin/bun'; do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  if candidate=$(command -v bun 2>/dev/null) && [ -x "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  return 1
+}
+
+# The global root the launcher links the engine against
+# (`omp_install.rs:117-130`), read straight from the installed manifest.
+installed_omp_version() {
+  local root
+  local manifest
+  local version
+
+  for root in ${BUN_INSTALL:+"$BUN_INSTALL"} "$HOME/.bun" "${BUN_BIN%/bin/bun}"; do
+    manifest="$root/install/global/node_modules/$OMP_PACKAGE/package.json"
+    [ -f "$manifest" ] || continue
+    version=$(/usr/bin/awk -F'"' '/"version"[[:space:]]*:/ { print $4; exit }' "$manifest")
+    if is_semver "$version"; then
+      printf '%s\n' "$version"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# `^MAJOR.MINOR.PATCH`: at or above the pin and below the next major.
+omp_version_satisfies() {
+  local version=$1
+  local minimum=${OMP_RANGE#^}
+
+  [ "${version%%.*}" = "${minimum%%.*}" ] || return 1
+  [ "$(semver_compare "$version" "$minimum")" != '-1' ]
+}
+
+# Idempotent: an existing Bun and an in-range OMP are left exactly as they are.
+install_launch_prerequisites() {
+  local version=''
+
+  if ! BUN_BIN=$(find_bun); then
+    printf 'OMP Agent bootstrap: installing Bun, which the app launcher requires.\n'
+    if ! /usr/bin/curl -fsSL --proto '=https' --tlsv1.2 "$BUN_INSTALLER_URL" | /bin/bash; then
+      fail "Could not install Bun from $BUN_INSTALLER_URL; install Bun and re-run."
+    fi
+    if ! BUN_BIN=$(find_bun); then
+      fail 'Bun is still not installed; install Bun and re-run.'
+    fi
+  fi
+  if version=$(installed_omp_version) && omp_version_satisfies "$version"; then
+    return 0
+  fi
+  printf 'OMP Agent bootstrap: installing %s@%s, which the app launcher requires.\n' "$OMP_PACKAGE" "$OMP_RANGE"
+  if ! "$BUN_BIN" add -g "$OMP_PACKAGE@$OMP_RANGE"; then
+    fail "Could not install $OMP_PACKAGE@$OMP_RANGE; run 'bun add -g $OMP_PACKAGE@$OMP_RANGE' and re-run."
+  fi
+  if ! version=$(installed_omp_version) || ! omp_version_satisfies "$version"; then
+    fail "$OMP_PACKAGE@$OMP_RANGE is not installed under the Bun global root; the app cannot start without it."
+  fi
+}
+
+# An install that replaces a newer bundle silently loses features and state
+# formats. Refuse it unless the caller asked for the downgrade explicitly.
+assert_not_downgrade() {
+  local installed
+
+  if ! installed=$(bundle_version "$TARGET_APP" 2>/dev/null); then
+    return 0
+  fi
+  if ! is_semver "$installed"; then
+    printf 'OMP Agent bootstrap: installed version %s is not a semantic version; skipping the downgrade check.\n' \
+      "$installed" >&2
+    return 0
+  fi
+  if [ "$(semver_compare "$RELEASE_VERSION" "$installed")" -ge 0 ]; then
+    return 0
+  fi
+  if [ "$ALLOW_DOWNGRADE" -eq 1 ]; then
+    printf 'Downgrading OMP Agent from version %s to %s as requested.\n' "$installed" "$RELEASE_VERSION"
+    return 0
+  fi
+  fail "Release version $RELEASE_VERSION is older than the installed version $installed; pass --allow-downgrade to replace it."
+}
+
 normalize_decimal() {
   local value=$1
   while [ "${#value}" -gt 1 ] && [ "${value#0}" != "$value" ]; do
     value=${value#0}
   done
   printf '%s' "$value"
+}
+
+# A prefix match alone is not a pin: `.../download/v1.2.3/../../other/asset` and
+# its percent-encoded spellings still start with the prefix but resolve
+# elsewhere. Require the remainder to be exactly one literal asset segment.
+assert_pinned_url() {
+  local url=$1
+  local prefix=$2
+  local label=$3
+  local remainder
+  local after_scheme
+
+  case "$url" in
+    "$prefix"*) ;;
+    *) fail "$label was not published under $prefix." ;;
+  esac
+  after_scheme=${url#*://}
+  case "$after_scheme" in
+    *..*|*//*) fail "$label contained a path traversal or an empty path segment." ;;
+  esac
+  case "$url" in
+    *%2e*|*%2E*|*%2f*|*%2F*) fail "$label contained a percent-encoded path separator." ;;
+  esac
+  remainder=${url#"$prefix"}
+  case "$remainder" in
+    ''|*[!A-Za-z0-9._-]*) fail "$label did not resolve to a single asset name under $prefix." ;;
+  esac
 }
 
 assert_https_url() {
@@ -219,6 +491,37 @@ extract_raw() {
   /usr/bin/plutil -extract "$key" raw -o - "$plist"
 }
 
+# `plutil -extract` prints an array's element count in raw mode, so one call per
+# document replaces the per-index probe that used to run plutil once per element.
+# A build that does not report a count falls back to that probe.
+array_count() {
+  local key=$1
+  local plist=$2
+  local count
+
+  if ! count=$(extract_raw "$key" "$plist" 2>/dev/null); then
+    printf '%s\n' 'unknown'
+    return 0
+  fi
+  case "$count" in
+    ''|*[!0-9]*) printf '%s\n' 'unknown' ;;
+    *) printf '%s\n' "$count" ;;
+  esac
+}
+
+array_has_index() {
+  local key=$1
+  local index=$2
+  local plist=$3
+  local total=$4
+
+  if [ "$total" = 'unknown' ]; then
+    /usr/bin/plutil -extract "$key.$index" xml1 -o /dev/null "$plist" >/dev/null 2>&1
+    return
+  fi
+  [ "$index" -lt "$total" ]
+}
+
 api_get() {
   local url=$1
   local destination=$2
@@ -241,6 +544,7 @@ resolve_release() {
   local draft
   local published_at
   local asset_index=0
+  local asset_total
   local asset_count=0
   local asset_name
   local installer_count=0
@@ -302,12 +606,13 @@ resolve_release() {
   esac
 
   asset_index=0
-  while /usr/bin/plutil -extract "assets.$asset_index" xml1 -o /dev/null "$release_json" >/dev/null 2>&1; do
+  asset_total=$(array_count 'assets' "$release_json")
+  while array_has_index 'assets' "$asset_index" "$release_json" "$asset_total"; do
     if ! asset_name=$(extract_raw "assets.$asset_index.name" "$release_json" 2>/dev/null); then
       fail "Release asset $asset_index did not contain a name."
     fi
     case "$asset_name" in
-      ''|*'/'*|*'\\'*|*$'\r'*|*$'\n'*|*$'\t'*)
+      ''|*'/'*|*"\\"*|*$'\r'*|*$'\n'*|*$'\t'*)
         fail 'A release asset had an invalid name.'
         ;;
     esac
@@ -366,6 +671,15 @@ resolve_release() {
 
   RELEASE_VERSION=$version
   RELEASE_INSTALLER_NAME=$installer_name
+
+  # Only the release contract's own prefix for this exact tag is acceptable; a
+  # substituted host in the release JSON is not this release.
+  local expected_prefix="$DOWNLOAD_PREFIX/v$RELEASE_VERSION/"
+  assert_pinned_url "$RELEASE_INSTALLER_URL" "$expected_prefix" "Installer asset '$installer_name'"
+  assert_pinned_url "$RELEASE_SIDECAR_URL" "$expected_prefix" "Checksum sidecar '$sidecar_name'"
+  if [ "$RELEASE_INSTALLER_SIZE" -gt "$MAX_DOWNLOAD_BYTES" ]; then
+    fail "Installer asset '$installer_name' declares $RELEASE_INSTALLER_SIZE bytes, above the $MAX_DOWNLOAD_BYTES byte ceiling."
+  fi
 }
 
 download_file() {
@@ -376,6 +690,7 @@ download_file() {
   if ! /usr/bin/curl --fail --silent --show-error --location \
     --proto '=https' --proto-redir '=https' \
     --connect-timeout 20 --max-time 900 --retry 2 --retry-delay 1 \
+    --max-filesize "$MAX_DOWNLOAD_BYTES" \
     -o "$destination" "$url"; then
     fail "HTTPS download of $label failed."
   fi
@@ -398,6 +713,41 @@ verify_download_size() {
   esac
   if [ "$(normalize_decimal "$actual")" != "$(normalize_decimal "$expected")" ]; then
     fail "Downloaded size $actual for $label did not match the release-declared size $expected."
+  fi
+}
+
+verify_pinned_asset() {
+  local path=$1
+  local asset=$2
+  local tag="v$RELEASE_VERSION"
+  local self=${BASH_SOURCE[0]}
+  local expected
+  local checksum_line
+  local digest
+
+  if [ ! -f "$self" ]; then
+    fail 'Could not read this script to load its pinned release table.'
+  fi
+  expected=$(/usr/bin/awk -v tag="$tag" -v asset="$asset" '
+    $0 == "# BEGIN PINNED" { inside = 1; next }
+    $0 == "# END PINNED" { inside = 0 }
+    inside && NF == 4 && $1 == "#" && $2 == tag && $3 == asset { print $4; exit }
+  ' "$self")
+  case "$expected" in
+    '') fail "Release $tag pins no SHA-256 for '$asset' in this script; refusing to install an unpinned build." ;;
+  esac
+  if [ "${#expected}" -ne 64 ]; then
+    fail "The pinned entry for '$asset' in $tag is malformed."
+  fi
+  case "$expected" in
+    *[!0-9a-f]*) fail "The pinned entry for '$asset' in $tag is malformed." ;;
+  esac
+  if ! checksum_line=$(/usr/bin/shasum -a 256 "$path" 2>/dev/null); then
+    fail "Could not compute the SHA-256 digest of '$asset'."
+  fi
+  digest=${checksum_line%% *}
+  if [ "$digest" != "$expected" ]; then
+    fail "The downloaded '$asset' did not match the SHA-256 pinned for $tag."
   fi
 }
 
@@ -491,8 +841,10 @@ validate_mount_point() {
 collect_mount_points() {
   local index=0
   local mount_point
+  local entity_total
 
-  while /usr/bin/plutil -extract "system-entities.$index" xml1 -o /dev/null "$ATTACH_PLIST" >/dev/null 2>&1; do
+  entity_total=$(array_count 'system-entities' "$ATTACH_PLIST")
+  while array_has_index 'system-entities' "$index" "$ATTACH_PLIST" "$entity_total"; do
     if mount_point=$(extract_raw "system-entities.$index.mount-point" "$ATTACH_PLIST" 2>/dev/null); then
       if ! validate_mount_point "$mount_point"; then
         return 1
@@ -637,6 +989,15 @@ stage_and_replace() {
   if ! /usr/bin/ditto "$SOURCE_APP" "$staged_app"; then
     fail 'Could not stage OMP Agent.app in the per-user Applications directory.'
   fi
+  # ditto out of a mounted DMG carries no quarantine attribute, so Gatekeeper
+  # never evaluates the copy. Mark it, and verify the signature we do ship.
+  if ! /usr/bin/codesign --verify --deep --strict "$staged_app" >/dev/null 2>&1; then
+    fail 'The staged OMP Agent.app failed codesign verification.'
+  fi
+  if ! /usr/bin/xattr -w com.apple.quarantine \
+    "0081;$(/usr/bin/printf '%x' "$(/bin/date +%s)");pi-agent-bootstrap;" "$staged_app"; then
+    fail 'Could not mark the staged app for Gatekeeper evaluation.'
+  fi
   if ! staged_version=$(bundle_version "$staged_app"); then
     fail 'The staged app did not contain CFBundleShortVersionString.'
   fi
@@ -715,6 +1076,9 @@ remove_legacy_bundles() {
 }
 
 install_release() {
+  # Before anything is downloaded or replaced: an app that cannot find Bun and
+  # a global OMP installs cleanly and then fails at launch.
+  install_launch_prerequisites
   if ! TEMP_ROOT=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/pi-agent-bootstrap.XXXXXX"); then
     fail 'Could not create a private temporary directory.'
   fi
@@ -731,9 +1095,11 @@ install_release() {
   download_file "$RELEASE_INSTALLER_URL" "$INSTALLER_PATH" "installer '$RELEASE_INSTALLER_NAME'"
   download_file "$RELEASE_SIDECAR_URL" "$SIDECAR_PATH" "checksum sidecar '$RELEASE_INSTALLER_NAME.sha256'"
   verify_download_size "$INSTALLER_PATH" "$RELEASE_INSTALLER_SIZE" "installer '$RELEASE_INSTALLER_NAME'"
+  verify_pinned_asset "$INSTALLER_PATH" "$RELEASE_INSTALLER_NAME"
   verify_checksum_sidecar
   mount_dmg
   locate_source_app
+  assert_not_downgrade
   stage_and_replace
   remove_legacy_bundles
   printf 'OMP Agent version %s installed at %s\n' "$RELEASE_VERSION" "$TARGET_APP"
